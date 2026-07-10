@@ -1,6 +1,7 @@
 #include "MainWindow.h"
 #include "Dictionary.h"
 #include "Scanner.h"
+#include "IcpScanner.h"
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -98,6 +99,56 @@ static bool anaOpt[7] = {true, true, true, true, true, true, true};
 
 // Header active tab (cosmetic highlight)
 static int activeTab = 0;
+
+// ===================================================================
+//  ICP备案查询数据
+// ===================================================================
+static char icpInputBuf[256 * 1024] = {0};
+static char icpDictPathBuf[512] = {0};
+static char icpApiUrlBuf[512] = {0};
+static std::vector<DomainSniper::IcpResult> icpResults;
+static std::mutex icpMutex;
+static std::atomic<bool> icpScanRunning{false};
+static std::atomic<int> icpScanProgress{0};
+static std::atomic<int> icpScanTotal{0};
+static bool icpShowHasIcp = true;
+static bool icpShowNoIcp = true;
+static bool icpShowError = false;
+static int icpFilterMinLen = 1;
+static int icpFilterMaxLen = 63;
+static int icpTldIndex = 0;
+static char icpTldStr[256] = "com,cn,org,net,co,io,cc,me,top,xyz,info,biz";
+static DomainSniper::IcpScanner icpScanner;
+static long long icpScanStartTime = 0;
+static bool icpApiConfigured = false;
+
+// 初始化ICP API URL
+static void InitIcpApiUrl() {
+    if (icpApiUrlBuf[0] == '\0') {
+        strcpy(icpApiUrlBuf, "https://api.uomg.com/api/icp");
+    }
+}
+
+// 从ICP扫描结果中导入域名到WHOIS扫描
+static void ImportIcpToScan(const std::vector<DomainSniper::IcpResult>& toImport) {
+    std::vector<std::string> existing;
+    {
+        std::lock_guard<std::mutex> lock(dataMutex);
+        for (const auto& r : scanResults) {
+            existing.push_back(r.domain);
+        }
+    }
+    for (const auto& r : toImport) {
+        if (std::find(existing.begin(), existing.end(), r.domain) == existing.end()) {
+            importDomainQueue.push_back(r.domain);
+        }
+    }
+    scanStartTriggered = true;
+    if (!importDomainQueue.empty()) {
+        strncpy(scanInputBuf, "", sizeof(scanInputBuf));
+        modeIdx = 1; // switch to import mode
+    }
+}
 
 // 设计稿基准：1600×900 (16:9)，所有区域尺寸按窗口等比缩放
 static constexpr float kDesignRefW = 1600.0f;
@@ -1091,13 +1142,20 @@ static void DrawCardIcon(ImDrawList *dl, ImVec2 center, int type, float r) {
                 IM_COL32(255, 255, 255, 200), 1.2f);
     dl->PathArcTo(center, r * 0.35f, -1.2f, 1.2f, 12);
     dl->PathStroke(IM_COL32(255, 255, 255, 180), 0, 1.2f);
-  } else {
+  } else if (type == 1) {
     // 灯泡图标
     dl->AddCircleFilled(ImVec2(center.x, center.y - r * 0.15f), r * 0.38f,
                         IM_COL32(255, 255, 255, 220));
     dl->AddRectFilled(ImVec2(center.x - r * 0.22f, center.y + r * 0.18f),
                       ImVec2(center.x + r * 0.22f, center.y + r * 0.42f),
                       IM_COL32(255, 255, 255, 200), 2.0f);
+  } else {
+    // 盾牌/备案图标
+    dl->AddRectFilled(ImVec2(center.x - r * 0.30f, center.y - r * 0.35f),
+                      ImVec2(center.x + r * 0.30f, center.y + r * 0.40f),
+                      IM_COL32(255, 255, 255, 220), r * 0.12f);
+    dl->AddText(ImVec2(center.x - r * 0.22f, center.y - r * 0.22f),
+                IM_COL32(255, 255, 255, 240), u8"备");
   }
 }
 
@@ -1117,8 +1175,10 @@ static void DrawOneCard(int idx, const char *title, const char *sub, float w, fl
   // Use a rounded rectangle instead of sharp MultiColor rect
   if (idx == 0) {
     dl->AddRectFilled(winPos, p1, IM_COL32(37, 99, 235, 255), DesignPx(10.0f));
-  } else {
+  } else if (idx == 1) {
     dl->AddRectFilled(winPos, p1, IM_COL32(139, 92, 246, 255), DesignPx(10.0f));
+  } else {
+    dl->AddRectFilled(winPos, p1, IM_COL32(20, 184, 166, 255), DesignPx(10.0f));
   }
 
   ImGui::SetCursorPos(ImVec2(0, 0));
@@ -1176,11 +1236,14 @@ static void DrawOneCard(int idx, const char *title, const char *sub, float w, fl
 static void DrawHeaderCards(float h) {
   float totalW = ImGui::GetContentRegionAvail().x;
   const float gap = DesignPx(kColumnGap);
-  float leftCardW = totalW * 0.60f - gap * 0.5f;
-  float rightCardW = totalW * 0.40f - gap * 0.5f;
+  float leftCardW = totalW * 0.38f - gap * 0.67f;
+  float midCardW = totalW * 0.28f - gap * 0.67f;
+  float rightCardW = totalW * 0.34f - gap * 0.67f;
   DrawOneCard(0, (const char *)u8"域名扫描", (const char *)u8"扫描域名是否已注册", leftCardW, h);
   ImGui::SameLine(0, gap);
-  DrawOneCard(1, (const char *)u8"域名寓意分析", (const char *)u8"分析域名寓意和价值", rightCardW, h);
+  DrawOneCard(1, (const char *)u8"域名寓意分析", (const char *)u8"分析域名寓意和价值", midCardW, h);
+  ImGui::SameLine(0, gap);
+  DrawOneCard(2, (const char *)u8"备案查询", (const char *)u8"查询域名ICP备案信息", rightCardW, h);
 }
 
 // ===================================================================
@@ -1820,6 +1883,218 @@ static void DrawFooter(float h) {
 // ===================================================================
 //  主渲染入口：整页垂直分区（标题栏 → 主体 → 底栏）+ 主体内左右分栏
 // ===================================================================
+// ===================================================================
+//  ICP备案查询面板
+// ===================================================================
+static void DrawIcpPanel() {
+  InitIcpApiUrl();
+
+  BeginPanel("IcpSettingsBox", ImVec2(0, 0));
+  DrawPanelTitle((const char*)u8"ICP备案查询", 2);
+
+  float panelW = ImGui::GetContentRegionAvail().x;
+
+  // --- 第一行：输入方式 ---
+  ImGui::TextUnformatted((const char*)u8"域名输入:");
+  ImGui::SameLine();
+  ImGui::PushItemWidth(panelW * 0.35f);
+  ImGui::InputTextWithHint("##icpInput", (const char*)u8"每行一个域名，或粘贴域名列表...",
+                           icpInputBuf, sizeof(icpInputBuf));
+  ImGui::PopItemWidth();
+  ImGui::SameLine();
+  if (ImGui::Button((const char*)u8"从文件导入", ImVec2(100, 0))) {
+    OPENFILENAMEA ofn = {sizeof(ofn)};
+    ofn.hwndOwner = GetActiveWindow();
+    ofn.lpstrFilter = "Text Files\0*.txt\0CSV Files\0*.csv\0All Files\0*.*\0";
+    ofn.lpstrFile = icpDictPathBuf;
+    ofn.nMaxFile = sizeof(icpDictPathBuf);
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+    if (GetOpenFileNameA(&ofn)) {
+      std::ifstream file(icpDictPathBuf);
+      if (file.is_open()) {
+        std::string content((std::istreambuf_iterator<char>(file)),
+                            std::istreambuf_iterator<char>());
+        file.close();
+        strncpy(icpInputBuf, content.c_str(), sizeof(icpInputBuf) - 1);
+      }
+    }
+  }
+
+  // --- 第二行：API设置 + 过滤 ---
+  ImGui::Spacing();
+  if (ImGui::CollapsingHeader((const char*)u8"API 设置")) {
+    ImGui::TextUnformatted((const char*)u8"API地址:");
+    ImGui::SameLine();
+    ImGui::PushItemWidth(panelW * 0.55f);
+    if (ImGui::InputTextWithHint("##icpApiUrl",
+          (const char*)u8"https://api.uomg.com/api/icp",
+          icpApiUrlBuf, sizeof(icpApiUrlBuf))) {
+      icpApiConfigured = true;
+    }
+    ImGui::PopItemWidth();
+    ImGui::SameLine();
+    ImGui::TextDisabled((const char*)u8"(?)");
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip((const char*)u8"免费ICP备案查询API\n默认: api.uomg.com\n也可用: api.vvhan.com/api/icp\n需要注册: apihz.cn, tianapi.com");
+  }
+
+  ImGui::Spacing();
+
+  // --- 过滤选项 ---
+  ImGui::TextUnformatted((const char*)u8"显示过滤:");
+  ImGui::SameLine();
+  ImGui::Checkbox((const char*)u8"已备案", &icpShowHasIcp);
+  ImGui::SameLine();
+  ImGui::Checkbox((const char*)u8"未备案", &icpShowNoIcp);
+  ImGui::SameLine();
+  ImGui::Checkbox((const char*)u8"错误", &icpShowError);
+
+  ImGui::SameLine(0, 30);
+  ImGui::TextUnformatted((const char*)u8"域名长度:");
+  ImGui::SameLine();
+  ImGui::PushItemWidth(50);
+  ImGui::InputInt("##icpMinLen", &icpFilterMinLen, 0);
+  ImGui::PopItemWidth();
+  ImGui::SameLine();
+  ImGui::TextUnformatted("-");
+  ImGui::SameLine();
+  ImGui::PushItemWidth(50);
+  ImGui::InputInt("##icpMaxLen", &icpFilterMaxLen, 0);
+  ImGui::PopItemWidth();
+
+  // --- 扫描按钮 ---
+  ImGui::Spacing();
+  bool canStart = !icpScanRunning.load() && strlen(icpInputBuf) > 0;
+  if (!canStart) ImGui::BeginDisabled();
+  if (ImGui::Button((const char*)u8"开始查询备案", ImVec2(130, 32))) {
+    // 解析输入域名
+    std::vector<std::string> domains;
+    std::string input(icpInputBuf);
+    std::stringstream ss(input);
+    std::string line;
+    while (std::getline(ss, line)) {
+      // 去除空白
+      line.erase(0, line.find_first_not_of(" \t\r\n"));
+      line.erase(line.find_last_not_of(" \t\r\n") + 1);
+      if (line.empty()) continue;
+      int len = (int)line.size();
+      if (len >= icpFilterMinLen && len <= icpFilterMaxLen) {
+        domains.push_back(line);
+      }
+    }
+    if (!domains.empty()) {
+      icpResults.clear();
+      icpScanStartTime = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count();
+      icpScanner.setApiUrl(icpApiUrlBuf);
+      icpScanner.startScan(domains,
+        [](int current, int total, const DomainSniper::IcpResult& result) {
+          icpScanProgress = current;
+          icpScanTotal = total;
+          std::lock_guard<std::mutex> lock(icpMutex);
+          icpResults.push_back(result);
+        },
+        [](const std::vector<DomainSniper::IcpResult>&) {
+          icpScanRunning = false;
+        });
+      icpScanRunning = true;
+    }
+  }
+  if (!canStart) ImGui::EndDisabled();
+
+  ImGui::SameLine();
+  if (icpScanRunning.load()) {
+    if (ImGui::Button((const char*)u8"停止查询", ImVec2(100, 32))) {
+      icpScanner.stopScan();
+      icpScanRunning = false;
+    }
+    ImGui::SameLine();
+    ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.0f, 1.0f),
+        (const char*)u8"查询中... %d/%d", icpScanProgress.load(), icpScanTotal.load());
+  } else if (!icpResults.empty()) {
+    ImGui::SameLine();
+    ImGui::TextColored(ImVec4(0.3f, 0.8f, 0.3f, 1.0f),
+        (const char*)u8"完成 %d 条", (int)icpResults.size());
+  }
+
+  // --- 快速导入到WHOIS扫描 ---
+  if (!icpResults.empty() && !icpScanRunning.load()) {
+    ImGui::SameLine();
+    if (ImGui::Button((const char*)u8"已备案域名 → WHOIS扫描", ImVec2(170, 28))) {
+      std::vector<DomainSniper::IcpResult> toImport;
+      for (const auto& r : icpResults) {
+        if (r.hasIcp) toImport.push_back(r);
+      }
+      ImportIcpToScan(toImport);
+    }
+  }
+
+  ImGui::EndChild();
+  // ── 结果表格 ──
+  ImGui::Spacing();
+  float tableH = ImGui::GetContentRegionAvail().y - DesignPx(10.0f);
+  if (tableH < DesignPx(100.0f)) tableH = DesignPx(100.0f);
+
+  BeginPanel("IcpResultsBox", ImVec2(0, tableH));
+  DrawPanelTitle((const char*)u8"查询结果", 2);
+
+  ImGui::BeginChild("IcpResultsScroll", ImVec2(0, ImGui::GetContentRegionAvail().y - DesignPx(5.0f)),
+                    false, ImGuiWindowFlags_HorizontalScrollbar);
+
+  if (ImGui::BeginTable("IcpResultTable", 7,
+        ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg |
+        ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY |
+        ImGuiTableFlags_Sortable)) {
+    ImGui::TableSetupColumn((const char*)u8"域名", ImGuiTableColumnFlags_WidthFixed, 150.0f);
+    ImGui::TableSetupColumn((const char*)u8"备案状态", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+    ImGui::TableSetupColumn((const char*)u8"备案号", ImGuiTableColumnFlags_WidthFixed, 160.0f);
+    ImGui::TableSetupColumn((const char*)u8"主办单位", ImGuiTableColumnFlags_WidthFixed, 200.0f);
+    ImGui::TableSetupColumn((const char*)u8"类型", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+    ImGui::TableSetupColumn((const char*)u8"审核时间", ImGuiTableColumnFlags_WidthFixed, 100.0f);
+    ImGui::TableSetupColumn((const char*)u8"响应(ms)", ImGuiTableColumnFlags_WidthFixed, 70.0f);
+    ImGui::TableHeadersRow();
+
+    std::lock_guard<std::mutex> lock(icpMutex);
+    for (const auto& r : icpResults) {
+      // 过滤
+      if (!icpShowHasIcp && r.hasIcp) continue;
+      if (!icpShowNoIcp && !r.hasIcp && r.success) continue;
+      if (!icpShowError && !r.success) continue;
+
+      ImGui::TableNextRow();
+      ImGui::TableSetColumnIndex(0);
+      ImGui::TextUnformatted(r.domain.c_str());
+
+      ImGui::TableSetColumnIndex(1);
+      if (r.hasIcp) {
+        ImGui::TextColored(ImVec4(0.1f, 0.8f, 0.3f, 1.0f), (const char*)u8"已备案");
+      } else if (r.success) {
+        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), (const char*)u8"未备案");
+      } else {
+        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), (const char*)u8"错误");
+      }
+
+      ImGui::TableSetColumnIndex(2);
+      ImGui::TextUnformatted(r.icpNumber.c_str());
+
+      ImGui::TableSetColumnIndex(3);
+      ImGui::TextUnformatted(r.companyName.c_str());
+
+      ImGui::TableSetColumnIndex(4);
+      ImGui::TextUnformatted(r.companyType.c_str());
+
+      ImGui::TableSetColumnIndex(5);
+      ImGui::TextUnformatted(r.auditTime.c_str());
+
+      ImGui::TableSetColumnIndex(6);
+      ImGui::Text("%d", r.responseTimeMs);
+    }
+    ImGui::EndTable();
+  }
+  ImGui::EndChild();
+  ImGui::EndChild();
+}
+
 void MainWindow::Render(GLFWwindow *window) {
   // 扫描运行计时：仅在「运行中且未暂停」时累加秒数
   auto tickNow = std::chrono::steady_clock::now();
@@ -1911,6 +2186,18 @@ void MainWindow::Render(GLFWwindow *window) {
   const float kCardH = DesignPx(80.0f);
   DrawHeaderCards(kCardH);
   ImGui::Dummy(ImVec2(0, kScaledSectionGap));
+
+  // ── 备案查询Tab（全宽面板）──
+  if (activeTab == 2) {
+    DrawIcpPanel();
+    ImGui::EndChild(); // Content
+    ImGui::EndChild(); // Body
+    ImGui::PopStyleVar();
+    DrawFooter(kFooterH);
+    ImGui::PopStyleVar();
+    ImGui::End();
+    return;
+  }
 
   const float colH = ImGui::GetContentRegionAvail().y;
   float totalW = ImGui::GetContentRegionAvail().x;

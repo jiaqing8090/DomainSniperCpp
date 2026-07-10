@@ -1,0 +1,317 @@
+#include "IcpScanner.h"
+#include <windows.h>
+#include <winhttp.h>
+#include <algorithm>
+#include <sstream>
+#include <chrono>
+
+#pragma comment(lib, "winhttp.lib")
+
+namespace DomainSniper {
+
+// 默认免费ICP查询API (可配置)
+static const char* DEFAULT_ICP_API = "https://api.uomg.com/api/icp";
+
+IcpScanner::IcpScanner() : m_apiUrl(DEFAULT_ICP_API) {}
+
+IcpScanner::~IcpScanner() { stopScan(); }
+
+void IcpScanner::setApiUrl(const std::string& url) { m_apiUrl = url; }
+void IcpScanner::setApiKey(const std::string& key) { m_apiKey = key; }
+
+void IcpScanner::stopScan() {
+    m_running = false;
+    if (m_thread.joinable()) {
+        m_thread.join();
+    }
+}
+
+void IcpScanner::startScan(const std::vector<std::string>& domains,
+                            ProgressCallback onProgress,
+                            FinishCallback onFinish) {
+    stopScan();
+    m_running = true;
+    m_thread = std::thread(&IcpScanner::scanThread, this, domains, onProgress, onFinish);
+}
+
+void IcpScanner::scanThread(const std::vector<std::string>& domains,
+                             ProgressCallback onProgress,
+                             FinishCallback onFinish) {
+    std::vector<IcpResult> results;
+    int total = (int)domains.size();
+
+    for (int i = 0; i < total && m_running; ++i) {
+        const auto& domain = domains[i];
+        if (domain.empty()) continue;
+
+        IcpResult result = querySingle(domain, m_apiUrl, m_apiKey);
+
+        if (m_running && onProgress) {
+            onProgress(i + 1, total, result);
+        }
+        results.push_back(result);
+    }
+
+    if (m_running && onFinish) {
+        onFinish(results);
+    }
+    m_running = false;
+}
+
+// 从URL中解析server、port、path
+static bool parseUrl(const std::string& url, std::wstring& server, int& port, std::wstring& path, bool& useSSL) {
+    std::string u = url;
+    useSSL = false;
+
+    if (u.substr(0, 8) == "https://") {
+        useSSL = true;
+        u = u.substr(8);
+    } else if (u.substr(0, 7) == "http://") {
+        u = u.substr(7);
+    }
+
+    // 去掉末尾斜杠
+    while (!u.empty() && u.back() == '/') u.pop_back();
+
+    size_t slashPos = u.find('/');
+    std::string hostPort, uriPath;
+    if (slashPos != std::string::npos) {
+        hostPort = u.substr(0, slashPos);
+        uriPath = u.substr(slashPos);
+    } else {
+        hostPort = u;
+        uriPath = "/";
+    }
+
+    // 解析端口
+    size_t colonPos = hostPort.find(':');
+    if (colonPos != std::string::npos) {
+        server = std::wstring(hostPort.begin(), hostPort.begin() + colonPos);
+        port = std::stoi(hostPort.substr(colonPos + 1));
+    } else {
+        server = std::wstring(hostPort.begin(), hostPort.end());
+        port = useSSL ? 443 : 80;
+    }
+
+    path = std::wstring(uriPath.begin(), uriPath.end());
+    return true;
+}
+
+// 简单的JSON字符串值提取
+static std::string jsonGetString(const std::string& json, const std::string& key) {
+    std::string search = "\"" + key + "\"";
+    size_t pos = json.find(search);
+    if (pos == std::string::npos) return "";
+
+    pos = json.find(':', pos + search.size());
+    if (pos == std::string::npos) return "";
+
+    // 跳过冒号和空白
+    pos++;
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t' || json[pos] == '\n')) pos++;
+
+    if (pos >= json.size()) return "";
+
+    if (json[pos] == '"') {
+        pos++; // 跳过开始引号
+        size_t end = pos;
+        while (end < json.size() && json[end] != '"') {
+            if (json[end] == '\\' && end + 1 < json.size()) end++; // 跳过转义
+            end++;
+        }
+        return json.substr(pos, end - pos);
+    }
+
+    // 数字或布尔值
+    if (json[pos] == 't' || json[pos] == 'f' || json[pos] == 'n' || (json[pos] >= '0' && json[pos] <= '9')) {
+        size_t end = pos;
+        while (end < json.size() && json[end] != ',' && json[end] != '}' && json[end] != ']' && json[end] != ' ' && json[end] != '\n') end++;
+        return json.substr(pos, end - pos);
+    }
+
+    return "";
+}
+
+// 简单的JSON整数值提取
+static int jsonGetInt(const std::string& json, const std::string& key) {
+    std::string val = jsonGetString(json, key);
+    if (val.empty()) return -1;
+    try { return std::stoi(val); }
+    catch (...) { return -1; }
+}
+
+IcpResult IcpScanner::parseResponse(const std::string& json, const std::string& domain) {
+    IcpResult result;
+    result.domain = domain;
+
+    if (json.empty()) {
+        result.errorMsg = "网络请求失败";
+        return result;
+    }
+
+    // 解析API返回的JSON
+    // 支持多种API格式:
+    // 格式1: {"code":1,"msg":"success","data":{"icp":"京ICP备030173号",...}}
+    // 格式2: {"success":true,"data":{"icp":"京ICP备030173号",...}}
+    // 格式3: {"code":200,"data":{"icp":"京ICP备030173号",...}}
+
+    std::string code = jsonGetString(json, "code");
+    bool success = (code == "1" || code == "200" || code == "0");
+
+    // 也检查 success 字段
+    std::string successStr = jsonGetString(json, "success");
+    if (successStr == "true") success = true;
+
+    result.success = true; // HTTP请求成功
+
+    if (!success && !code.empty()) {
+        std::string msg = jsonGetString(json, "msg");
+        if (msg.empty()) msg = jsonGetString(json, "message");
+        result.errorMsg = msg.empty() ? "查询失败" : msg;
+        result.hasIcp = false;
+        return result;
+    }
+
+    // 提取 data 对象中的内容
+    result.icpNumber = jsonGetString(json, "icp");
+    if (result.icpNumber.empty()) result.icpNumber = jsonGetString(json, "icpno");
+    if (result.icpNumber.empty()) result.icpNumber = jsonGetString(json, "filingNumber");
+
+    result.companyName = jsonGetString(json, "company");
+    if (result.companyName.empty()) result.companyName = jsonGetString(json, "unitName");
+    if (result.companyName.empty()) result.companyName = jsonGetString(json, "siteName");
+    if (result.companyName.empty()) result.companyName = jsonGetString(json, "sponsorName");
+
+    result.companyType = jsonGetString(json, "companyType");
+    if (result.companyType.empty()) result.companyType = jsonGetString(json, "unitType");
+    if (result.companyType.empty()) result.companyType = jsonGetString(json, "natureName");
+
+    result.auditTime = jsonGetString(json, "auditTime");
+    if (result.auditTime.empty()) result.auditTime = jsonGetString(json, "passDate");
+    if (result.auditTime.empty()) result.auditTime = jsonGetString(json, "limitAccess");
+
+    result.siteName = jsonGetString(json, "siteName");
+    if (result.siteName.empty()) result.siteName = jsonGetString(json, "siteName");
+    result.siteUrl = jsonGetString(json, "siteUrl");
+    if (result.siteUrl.empty()) result.siteUrl = jsonGetString(json, "siteAddress");
+
+    result.hasIcp = !result.icpNumber.empty();
+
+    if (!result.hasIcp) {
+        result.errorMsg = "未备案";
+    }
+
+    return result;
+}
+
+std::string IcpScanner::httpGet(const std::wstring& server, int port,
+                                 const std::wstring& path, bool useSSL) {
+    std::string response;
+
+    HINTERNET hSession = WinHttpOpen(
+        L"DomainSniper/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS, 0);
+
+    if (!hSession) return "";
+
+    HINTERNET hConnect = WinHttpConnect(hSession, server.c_str(), port, 0);
+    if (!hConnect) {
+        WinHttpCloseHandle(hSession);
+        return "";
+    }
+
+    DWORD flags = useSSL ? WINHTTP_FLAG_SECURE : 0;
+    HINTERNET hRequest = WinHttpOpenRequest(
+        hConnect, L"GET", path.c_str(),
+        NULL, WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+
+    if (!hRequest) {
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return "";
+    }
+
+    // 设置超时
+    DWORD timeout = 5000; // 5秒
+    WinHttpSetOption(hRequest, WINHTTP_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(timeout));
+    WinHttpSetOption(hRequest, WINHTTP_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(timeout));
+
+    BOOL result = WinHttpSendRequest(hRequest,
+        WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+        WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
+
+    if (result) {
+        result = WinHttpReceiveResponse(hRequest, NULL);
+    }
+
+    if (result) {
+        DWORD dwSize = 0;
+        do {
+            dwSize = 0;
+            if (!WinHttpQueryDataAvailable(hRequest, &dwSize)) break;
+            if (dwSize == 0) break;
+
+            char* buffer = new char[dwSize + 1];
+            ZeroMemory(buffer, dwSize + 1);
+            DWORD dwDownloaded = 0;
+            if (WinHttpReadData(hRequest, buffer, dwSize, &dwDownloaded)) {
+                response.append(buffer, dwDownloaded);
+            }
+            delete[] buffer;
+        } while (dwSize > 0);
+    }
+
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+
+    return response;
+}
+
+IcpResult IcpScanner::querySingle(const std::string& domain,
+                                    const std::string& apiUrl,
+                                    const std::string& apiKey) {
+    IcpResult result;
+    result.domain = domain;
+
+    auto start = std::chrono::steady_clock::now();
+
+    std::string url = apiUrl.empty() ? DEFAULT_ICP_API : apiUrl;
+
+    // 构建完整URL: API + domain参数
+    // 如果API URL已包含参数分隔符则用&，否则用?
+    std::string fullUrl = url;
+    bool hasQuery = (fullUrl.find('?') != std::string::npos);
+    fullUrl += (hasQuery ? "&" : "?") + std::string("domain=") + domain;
+
+    if (!apiKey.empty()) {
+        fullUrl += "&key=" + apiKey;
+    }
+
+    std::wstring server, path;
+    int port = 80;
+    bool useSSL = false;
+    if (!parseUrl(fullUrl, server, port, path, useSSL)) {
+        result.errorMsg = "URL解析失败";
+        return result;
+    }
+
+    std::string json = httpGet(server, port, path, useSSL);
+
+    auto end = std::chrono::steady_clock::now();
+    result.responseTimeMs = (int)std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+
+    if (json.empty()) {
+        result.errorMsg = "请求超时或网络错误";
+        return result;
+    }
+
+    result = parseResponse(json, domain);
+    result.responseTimeMs = (int)std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    return result;
+}
+
+} // namespace DomainSniper

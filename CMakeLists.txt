@@ -58,6 +58,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     glfw
     opengl32
     ws2_32
+    winhttp
     dwmapi
 )
 
