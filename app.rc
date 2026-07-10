@@ -1,0 +1,5 @@
+#include "resource.h"
+
+IDI_ICON1 ICON "assets/icon.ico"
+IDR_ECDICT RCDATA "assets/ecdict.csv"
+IDR_ZENCHYN RCDATA "assets/zenchyn.png"
