@@ -129,25 +129,29 @@ static void InitIcpApiUrl() {
     }
 }
 
-// 从ICP扫描结果中导入域名到WHOIS扫描
+// 从ICP扫描结果中导入域名到WHOIS扫描（写入临时字典文件）
 static void ImportIcpToScan(const std::vector<DomainSniper::IcpResult>& toImport) {
-    std::vector<std::string> existing;
-    {
+    if (toImport.empty()) return;
+    std::string tempPath = std::string(getenv("TEMP") ? getenv("TEMP") : ".") + "/icp_import_domains.txt";
+    std::ofstream ofs(tempPath);
+    if (!ofs.is_open()) {
         std::lock_guard<std::mutex> lock(dataMutex);
-        for (const auto& r : scanResults) {
-            existing.push_back(r.domain);
-        }
+        logLines.push_back((const char*)u8"[Error] 无法创建导入文件");
+        return;
     }
     for (const auto& r : toImport) {
-        if (std::find(existing.begin(), existing.end(), r.domain) == existing.end()) {
-            importDomainQueue.push_back(r.domain);
-        }
+        // 去掉域名中的 www. 前缀和端口号
+        std::string d = r.domain;
+        if (d.find("www.") == 0) d = d.substr(4);
+        size_t portPos = d.find(':');
+        if (portPos != std::string::npos) d = d.substr(0, portPos);
+        ofs << d << "\n";
     }
-    scanStartTriggered = true;
-    if (!importDomainQueue.empty()) {
-        strncpy(scanInputBuf, "", sizeof(scanInputBuf));
-        modeIdx = 1; // switch to import mode
-    }
+    ofs.close();
+    strncpy(scanDictBuf, tempPath.c_str(), sizeof(scanDictBuf) - 1);
+    activeTab = 0; // 切换到WHOIS扫描Tab
+    std::lock_guard<std::mutex> lock(dataMutex);
+    logLines.push_back((const char*)u8"[INFO] 已从ICP结果导入 " + std::to_string(toImport.size()) + (const char*)u8" 个域名到WHOIS扫描");
 }
 
 // 设计稿基准：1600×900 (16:9)，所有区域尺寸按窗口等比缩放
@@ -1155,7 +1159,7 @@ static void DrawCardIcon(ImDrawList *dl, ImVec2 center, int type, float r) {
                       ImVec2(center.x + r * 0.30f, center.y + r * 0.40f),
                       IM_COL32(255, 255, 255, 220), r * 0.12f);
     dl->AddText(ImVec2(center.x - r * 0.22f, center.y - r * 0.22f),
-                IM_COL32(255, 255, 255, 240), u8"备");
+                IM_COL32(255, 255, 255, 240), (const char*)u8"备");
   }
 }
 
