@@ -94,6 +94,69 @@ static int scanCurTldIdx = 0;
 static long long scanCurLen = 0;   // 内存生成模式: 当前长度
 static long long scanCurIndex = 0; // 内存生成模式: 当前序号
 
+// ICP 自动检测（WHOIS扫描中集成）
+static bool icpCheckEnabled = false;
+static int icpResultFilter = 0; // 0=全部, 1=已备案, 2=未备案, 3=未查询
+static std::unordered_map<std::string, std::string> icpStatusMap; // domain -> "已备案"/"未备案"/"查询失败"
+static std::mutex icpStatusMapMutex;
+static std::vector<std::string> icpCheckQueue;
+static std::mutex icpCheckQueueMutex;
+static std::thread icpCheckThread;
+static std::atomic<bool> icpCheckThreadRunning{false};
+static std::atomic<int> icpCheckedCount{0};
+
+// ICP后台查询线程
+static void IcpCheckThreadFunc() {
+    while (icpCheckThreadRunning.load()) {
+        std::string domain;
+        {
+            std::lock_guard<std::mutex> lock(icpCheckQueueMutex);
+            if (!icpCheckQueue.empty()) {
+                domain = icpCheckQueue.back();
+                icpCheckQueue.pop_back();
+            }
+        }
+        if (domain.empty()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            continue;
+        }
+        // 去掉TLD，只查裸域名
+        std::string bareDomain = domain;
+        auto dotPos = bareDomain.find('.');
+        // 保留完整域名用于ICP查询
+        auto result = DomainSniper::IcpScanner::querySingle(domain, icpApiUrlBuf);
+        {
+            std::lock_guard<std::mutex> lock(icpStatusMapMutex);
+            if (result.hasIcp) {
+                icpStatusMap[domain] = (const char*)u8"已备案";
+            } else if (result.success) {
+                icpStatusMap[domain] = (const char*)u8"未备案";
+            } else {
+                icpStatusMap[domain] = (const char*)u8"查询失败";
+            }
+        }
+        icpCheckedCount++;
+    }
+}
+
+static void StartIcpCheckThread() {
+    if (icpCheckThreadRunning.load()) return;
+    icpCheckThreadRunning = true;
+    icpCheckedCount = 0;
+    icpCheckThread = std::thread(IcpCheckThreadFunc);
+}
+
+static void StopIcpCheckThread() {
+    icpCheckThreadRunning = false;
+    if (icpCheckThread.joinable()) {
+        icpCheckThread.join();
+    }
+    {
+        std::lock_guard<std::mutex> lock(icpCheckQueueMutex);
+        icpCheckQueue.clear();
+    }
+}
+
 // Analysis options
 static bool anaOpt[7] = {true, true, true, true, true, true, true};
 
@@ -809,6 +872,13 @@ static void ClearResults() {
   scanResults.clear();
   logLines.clear();
   logLines.push_back((const char *)u8"[INFO] 已清空扫描结果");
+  // 清空ICP状态
+  StopIcpCheckThread();
+  {
+    std::lock_guard<std::mutex> icpLock(icpStatusMapMutex);
+    icpStatusMap.clear();
+  }
+  icpCheckedCount = 0;
 }
 
 // ===================================================================
@@ -821,6 +891,19 @@ static void StartScanAction() {
     scanResults.clear();
     logLines.clear();
     logLines.push_back((const char *)u8"[INFO] 初始化扫描器...");
+  }
+
+  // 启动ICP后台线程（如果启用）
+  if (icpCheckEnabled) {
+    InitIcpApiUrl();
+    StopIcpCheckThread();
+    {
+      std::lock_guard<std::mutex> lock(icpStatusMapMutex);
+      icpStatusMap.clear();
+    }
+    StartIcpCheckThread();
+    std::lock_guard<std::mutex> lock(dataMutex);
+    logLines.push_back((const char *)u8"[INFO] ICP备案自动检测已启用");
   }
 
   std::vector<std::string> tlds;
@@ -936,16 +1019,27 @@ static void StartScanAction() {
         std::lock_guard<std::mutex> lock(dataMutex);
         if (r.status == (const char *)u8"可注册") {
           scanResults.push_back(r);
-          if (scanResults.size() > 1000) scanResults.erase(scanResults.begin());
+          if (scanResults.size() > 3000) scanResults.erase(scanResults.begin());
           logLines.push_back((const char *)u8"[OK] " + r.domain +
                              (const char *)u8" 可注册 " +
                              std::to_string(r.responseTimeMs) + "ms");
           if (logLines.size() > 200) logLines.erase(logLines.begin());
+        } else if (icpCheckEnabled && r.status == (const char *)u8"已注册") {
+          // ICP模式：也记录已注册域名，并排队查ICP
+          scanResults.push_back(r);
+          if (scanResults.size() > 3000) scanResults.erase(scanResults.begin());
+          {
+            std::lock_guard<std::mutex> qlock(icpCheckQueueMutex);
+            icpCheckQueue.push_back(r.domain);
+          }
         }
       },
       []() {
         std::lock_guard<std::mutex> lock(dataMutex);
         logLines.push_back((const char *)u8"[INFO] 扫描任务已完成。");
+        if (icpCheckEnabled) {
+          logLines.push_back((const char *)u8"[INFO] ICP备案查询仍在进行中，请等待...");
+        }
         scanIsRunning = false;
       });
 }
@@ -1344,6 +1438,20 @@ static void DrawScanSettings(float h) {
   }
   ImGui::EndGroup();
 
+  // 5. ICP备案自动检测
+  ImGui::Spacing();
+  ImGui::AlignTextToFramePadding();
+  ImGui::TextDisabled((const char *)u8"ICP备案:");
+  ImGui::SameLine(DesignPx(100.0f));
+  ImGui::Checkbox((const char*)u8"启用ICP备案自动检测 (扫描已注册域名时查询备案)", &icpCheckEnabled);
+  if (icpCheckEnabled) {
+    ImGui::SameLine();
+    ImGui::TextDisabled((const char *)u8"过滤:");
+    ImGui::SameLine();
+    const char* items[] = {(const char*)u8"全部", (const char*)u8"仅已备案", (const char*)u8"仅未备案", (const char*)u8"仅未查询"};
+    ImGui::Combo("##icpFilter", &icpResultFilter, items, 4);
+  }
+
   ImGui::PopStyleVar();
 
   ImGui::EndChild(); // scfgL
@@ -1419,7 +1527,11 @@ static void DrawScanResults(float h) {
   ImFont *bigFont = ImGui::GetIO().Fonts->Fonts.Size > 2 ? ImGui::GetIO().Fonts->Fonts[2] : ImGui::GetFont();
   ImGui::PushFont(bigFont);
   ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(37.0f/255.0f, 99.0f/255.0f, 235.0f/255.0f, 1.0f));
-  ImGui::TextUnformatted((const char *)u8"扫描结果 (可注册域名)");
+  if (icpCheckEnabled) {
+    ImGui::TextUnformatted((const char *)u8"扫描结果 (含ICP备案检测)");
+  } else {
+    ImGui::TextUnformatted((const char *)u8"扫描结果 (可注册域名)");
+  }
   ImGui::PopStyleColor();
   ImGui::PopFont();
   float expW = DesignPx(100.0f);
@@ -1467,7 +1579,8 @@ static void DrawScanResults(float h) {
 
   const float tableH = ImGui::GetContentRegionAvail().y;
 
-  if (ImGui::BeginTable("ResTable", 6,
+  int nCols = icpCheckEnabled ? 7 : 6;
+  if (ImGui::BeginTable("ResTable", nCols,
                         ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                             ImGuiTableFlags_ScrollX | ImGuiTableFlags_Borders |
                             ImGuiTableFlags_Resizable,
@@ -1476,6 +1589,8 @@ static void DrawScanResults(float h) {
     ImGui::TableSetupColumn((const char *)u8"后缀", ImGuiTableColumnFlags_WidthFixed, 55.0f);
     ImGui::TableSetupColumn((const char *)u8"状态", ImGuiTableColumnFlags_WidthFixed, 60.0f);
     ImGui::TableSetupColumn((const char *)u8"响应时间", ImGuiTableColumnFlags_WidthFixed, 75.0f);
+    if (icpCheckEnabled)
+      ImGui::TableSetupColumn((const char *)u8"ICP备案", ImGuiTableColumnFlags_WidthFixed, 70.0f);
     ImGui::TableSetupColumn((const char *)u8"注册商", ImGuiTableColumnFlags_WidthStretch);
     ImGui::TableSetupColumn((const char *)u8"发现时间", ImGuiTableColumnFlags_WidthFixed, 145.0f);
     ImGui::TableSetupScrollFreeze(0, 1);
@@ -1483,6 +1598,19 @@ static void DrawScanResults(float h) {
 
     std::lock_guard<std::mutex> lock(dataMutex);
     for (const auto &r : scanResults) {
+      // ICP过滤
+      if (icpCheckEnabled && icpResultFilter != 0) {
+        std::string icpStatus;
+        {
+          std::lock_guard<std::mutex> icpLock(icpStatusMapMutex);
+          auto it = icpStatusMap.find(r.domain);
+          if (it != icpStatusMap.end()) icpStatus = it->second;
+        }
+        if (icpResultFilter == 1 && icpStatus != (const char*)u8"已备案") continue;
+        if (icpResultFilter == 2 && icpStatus != (const char*)u8"未备案") continue;
+        if (icpResultFilter == 3 && !icpStatus.empty()) continue;
+      }
+
       ImGui::TableNextRow();
       ImGui::TableNextColumn();
       ImGui::TextColored(kColorTextPrimary, "%s", r.domain.c_str());
@@ -1494,6 +1622,24 @@ static void DrawScanResults(float h) {
                          "%s", r.status.c_str());
       ImGui::TableNextColumn();
       ImGui::Text("%dms", r.responseTimeMs);
+      if (icpCheckEnabled) {
+        ImGui::TableNextColumn();
+        std::string icpStatus;
+        {
+          std::lock_guard<std::mutex> icpLock(icpStatusMapMutex);
+          auto it = icpStatusMap.find(r.domain);
+          if (it != icpStatusMap.end()) icpStatus = it->second;
+        }
+        if (icpStatus.empty()) {
+          ImGui::TextDisabled((const char*)u8"查询中...");
+        } else if (icpStatus == (const char*)u8"已备案") {
+          ImGui::TextColored(ImVec4(0.1f, 0.8f, 0.3f, 1.0f), "%s", icpStatus.c_str());
+        } else if (icpStatus == (const char*)u8"未备案") {
+          ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "%s", icpStatus.c_str());
+        } else {
+          ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", icpStatus.c_str());
+        }
+      }
       ImGui::TableNextColumn();
       ImGui::TextUnformatted(r.registrar.c_str());
       ImGui::TableNextColumn();
@@ -1875,7 +2021,14 @@ static void DrawFooter(float h) {
   ImGui::PopStyleColor(2);
 
   FooterMetric(0.40f, (const char *)u8"已扫描:", s1.c_str(), val);
-  FooterMetric(0.55f, (const char *)u8"剩余:", sRem.c_str(), val);
+  if (icpCheckEnabled) {
+    int ichecked = icpCheckedCount.load();
+    char icpBuf[32];
+    snprintf(icpBuf, sizeof(icpBuf), "%d", ichecked);
+    FooterMetric(0.55f, (const char *)u8"ICP已查:", icpBuf, ImVec4(0.5f, 0.8f, 1.0f, 1.0f));
+  } else {
+    FooterMetric(0.55f, (const char *)u8"剩余:", sRem.c_str(), val);
+  }
   FooterMetric(0.70f, (const char *)u8"可注册:", s2.c_str(), ImVec4(0.75f, 1.0f, 0.85f, 1.0f));
   FooterMetric(0.85f, (const char *)u8"运行时间:", timeStr, val);
 
