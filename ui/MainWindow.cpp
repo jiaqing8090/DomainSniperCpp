@@ -104,8 +104,51 @@ static std::mutex icpCheckQueueMutex;
 static std::thread icpCheckThread;
 static std::atomic<bool> icpCheckThreadRunning{false};
 static std::atomic<int> icpCheckedCount{0};
+// icpApiUrlBuf 声明 (实现在后面ICP备案查询数据区)
+static char icpApiUrlBuf[512] = {0};
 
-// ICP后台查询线程
+// ICP后台查询线程 (定义在icpApiUrlBuf之后)
+static void IcpCheckThreadFunc();
+static void StartIcpCheckThread();
+static void StopIcpCheckThread();
+
+// Analysis options
+static bool anaOpt[7] = {true, true, true, true, true, true, true};
+
+// Header active tab (cosmetic highlight)
+static int activeTab = 0;
+
+// ===================================================================
+//  ICP备案查询数据
+// ===================================================================
+static char icpInputBuf[256 * 1024] = {0};
+static char icpDictPathBuf[512] = {0};
+static std::vector<DomainSniper::IcpResult> icpResults;
+static std::mutex icpMutex;
+static std::atomic<bool> icpScanRunning{false};
+static std::atomic<int> icpScanProgress{0};
+static std::atomic<int> icpScanTotal{0};
+static bool icpShowHasIcp = true;
+static bool icpShowNoIcp = true;
+static bool icpShowError = false;
+static int icpFilterMinLen = 1;
+static int icpFilterMaxLen = 63;
+static int icpTldIndex = 0;
+static char icpTldStr[256] = "com,cn,org,net,co,io,cc,me,top,xyz,info,biz";
+static DomainSniper::IcpScanner icpScanner;
+static long long icpScanStartTime = 0;
+static bool icpApiConfigured = false;
+
+// 初始化ICP API URL
+static void InitIcpApiUrl() {
+    if (icpApiUrlBuf[0] == '\0') {
+        strcpy(icpApiUrlBuf, "https://api.uomg.com/api/icp");
+    }
+}
+
+// ===================================================================
+// ICP后台查询线程（集成到WHOIS扫描中）
+// ===================================================================
 static void IcpCheckThreadFunc() {
     while (icpCheckThreadRunning.load()) {
         std::string domain;
@@ -120,10 +163,6 @@ static void IcpCheckThreadFunc() {
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
             continue;
         }
-        // 去掉TLD，只查裸域名
-        std::string bareDomain = domain;
-        auto dotPos = bareDomain.find('.');
-        // 保留完整域名用于ICP查询
         auto result = DomainSniper::IcpScanner::querySingle(domain, icpApiUrlBuf);
         {
             std::lock_guard<std::mutex> lock(icpStatusMapMutex);
@@ -154,41 +193,6 @@ static void StopIcpCheckThread() {
     {
         std::lock_guard<std::mutex> lock(icpCheckQueueMutex);
         icpCheckQueue.clear();
-    }
-}
-
-// Analysis options
-static bool anaOpt[7] = {true, true, true, true, true, true, true};
-
-// Header active tab (cosmetic highlight)
-static int activeTab = 0;
-
-// ===================================================================
-//  ICP备案查询数据
-// ===================================================================
-static char icpInputBuf[256 * 1024] = {0};
-static char icpDictPathBuf[512] = {0};
-static char icpApiUrlBuf[512] = {0};
-static std::vector<DomainSniper::IcpResult> icpResults;
-static std::mutex icpMutex;
-static std::atomic<bool> icpScanRunning{false};
-static std::atomic<int> icpScanProgress{0};
-static std::atomic<int> icpScanTotal{0};
-static bool icpShowHasIcp = true;
-static bool icpShowNoIcp = true;
-static bool icpShowError = false;
-static int icpFilterMinLen = 1;
-static int icpFilterMaxLen = 63;
-static int icpTldIndex = 0;
-static char icpTldStr[256] = "com,cn,org,net,co,io,cc,me,top,xyz,info,biz";
-static DomainSniper::IcpScanner icpScanner;
-static long long icpScanStartTime = 0;
-static bool icpApiConfigured = false;
-
-// 初始化ICP API URL
-static void InitIcpApiUrl() {
-    if (icpApiUrlBuf[0] == '\0') {
-        strcpy(icpApiUrlBuf, "https://api.uomg.com/api/icp");
     }
 }
 
