@@ -56,7 +56,8 @@ private:
                     FinishCallback onFinish);
 
     static std::string httpGet(const std::wstring& server, int port,
-                               const std::wstring& path, bool useSSL);
+                               const std::wstring& path, bool useSSL,
+                               DWORD timeoutMs = 8000);
     static IcpResult parseResponse(const std::string& json, const std::string& domain);
 
     std::string m_apiUrl;

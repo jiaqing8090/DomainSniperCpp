@@ -175,8 +175,8 @@ static void IcpCheckThreadFunc() {
             }
         }
         icpCheckedCount++;
-        // 公共API限频~328次/分钟，间隔500ms避免触发
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        // 公共API限频~328次/分钟，间隔200ms(约5次/秒，300次/分钟)
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 }
 

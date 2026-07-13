@@ -4,16 +4,20 @@
 #include <algorithm>
 #include <sstream>
 #include <chrono>
+#include <random>
 
 #pragma comment(lib, "winhttp.lib")
 
 namespace DomainSniper {
 
-// 默认免费ICP查询API (公共测试ID/KEY，每分钟限频，建议注册后替换为自己的)
-// 接口盒子: https://www.apihz.cn/api/wangzhanicp.html
-static const char* DEFAULT_ICP_API = "https://cn.apihz.cn/api/wangzhan/icp.php?id=88888888&key=88888888";
+// 多个备用API端点 (接口盒子负载均衡)
+static const char* API_ENDPOINTS[] = {
+    "https://cn.apihz.cn/api/wangzhan/icp.php?id=88888888&key=88888888",
+    "https://vip.apihz.cn/api/wangzhan/icp.php?id=88888888&key=88888888",
+};
+static const int API_ENDPOINT_COUNT = sizeof(API_ENDPOINTS) / sizeof(API_ENDPOINTS[0]);
 
-IcpScanner::IcpScanner() : m_apiUrl(DEFAULT_ICP_API) {}
+IcpScanner::IcpScanner() : m_apiUrl(API_ENDPOINTS[0]) {}
 
 IcpScanner::~IcpScanner() { stopScan(); }
 
@@ -185,7 +189,8 @@ IcpResult IcpScanner::parseResponse(const std::string& json, const std::string& 
 }
 
 std::string IcpScanner::httpGet(const std::wstring& server, int port,
-                                 const std::wstring& path, bool useSSL) {
+                                 const std::wstring& path, bool useSSL,
+                                 DWORD timeoutMs) {
     std::string response;
 
     HINTERNET hSession = WinHttpOpen(
@@ -196,7 +201,13 @@ std::string IcpScanner::httpGet(const std::wstring& server, int port,
 
     if (!hSession) return "";
 
-    HINTERNET hConnect = WinHttpConnect(hSession, server.c_str(), port, 0);
+    // 设置全局超时
+    WinHttpSetOption(hSession, WINHTTP_OPTION_RESOLVE_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
+    WinHttpSetOption(hSession, WINHTTP_OPTION_CONNECT_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
+    WinHttpSetOption(hSession, WINHTTP_OPTION_SEND_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
+    WinHttpSetOption(hSession, WINHTTP_OPTION_RECEIVE_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
+
+    HINTERNET hConnect = WinHttpConnect(hSession, server.c_str(), (INTERNET_PORT)port, 0);
     if (!hConnect) {
         WinHttpCloseHandle(hSession);
         return "";
@@ -214,10 +225,9 @@ std::string IcpScanner::httpGet(const std::wstring& server, int port,
         return "";
     }
 
-    // 设置超时
-    DWORD timeout = 5000; // 5秒
-    WinHttpSetOption(hRequest, WINHTTP_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(timeout));
-    WinHttpSetOption(hRequest, WINHTTP_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(timeout));
+    // 禁用自动重定向（简化逻辑）
+    DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+    WinHttpSetOption(hRequest, WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy, sizeof(redirectPolicy));
 
     BOOL result = WinHttpSendRequest(hRequest,
         WINHTTP_NO_ADDITIONAL_HEADERS, 0,
@@ -228,20 +238,26 @@ std::string IcpScanner::httpGet(const std::wstring& server, int port,
     }
 
     if (result) {
-        DWORD dwSize = 0;
-        do {
-            dwSize = 0;
-            if (!WinHttpQueryDataAvailable(hRequest, &dwSize)) break;
-            if (dwSize == 0) break;
+        DWORD dwStatusCode = 0;
+        DWORD dwSize = sizeof(dwStatusCode);
+        WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                            WINHTTP_HEADER_NAME_BY_INDEX, &dwStatusCode, &dwSize, WINHTTP_NO_HEADER_INDEX);
 
-            char* buffer = new char[dwSize + 1];
-            ZeroMemory(buffer, dwSize + 1);
-            DWORD dwDownloaded = 0;
-            if (WinHttpReadData(hRequest, buffer, dwSize, &dwDownloaded)) {
-                response.append(buffer, dwDownloaded);
-            }
-            delete[] buffer;
-        } while (dwSize > 0);
+        if (dwStatusCode == 200) {
+            do {
+                dwSize = 0;
+                if (!WinHttpQueryDataAvailable(hRequest, &dwSize)) break;
+                if (dwSize == 0) break;
+
+                char* buffer = new char[dwSize + 1];
+                ZeroMemory(buffer, dwSize + 1);
+                DWORD dwDownloaded = 0;
+                if (WinHttpReadData(hRequest, buffer, dwSize, &dwDownloaded)) {
+                    response.append(buffer, dwDownloaded);
+                }
+                delete[] buffer;
+            } while (dwSize > 0);
+        }
     }
 
     WinHttpCloseHandle(hRequest);
@@ -259,7 +275,7 @@ IcpResult IcpScanner::querySingle(const std::string& domain,
 
     auto start = std::chrono::steady_clock::now();
 
-    std::string url = apiUrl.empty() ? DEFAULT_ICP_API : apiUrl;
+    std::string url = apiUrl.empty() ? API_ENDPOINTS[0] : apiUrl;
 
     // 构建完整URL: API + domain参数
     // 基础URL已包含 ?id=xxx&key=xxx，追加 &domain=
@@ -278,7 +294,37 @@ IcpResult IcpScanner::querySingle(const std::string& domain,
         return result;
     }
 
-    std::string json = httpGet(server, port, path, useSSL);
+    // 主请求 + 重试机制
+    std::string json;
+    const int MAX_RETRIES = 2;
+    const DWORD TIMEOUT_MS = 8000; // 8秒超时
+
+    for (int attempt = 0; attempt <= MAX_RETRIES; ++attempt) {
+        json = httpGet(server, port, path, useSSL, TIMEOUT_MS);
+        if (!json.empty()) break;
+
+        // 第一次失败后短暂等待再重试
+        if (attempt < MAX_RETRIES) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(300 * (attempt + 1)));
+        }
+    }
+
+    // 如果主URL全部失败，尝试备用API端点
+    if (json.empty() && apiUrl.empty()) {
+        for (int ep = 1; ep < API_ENDPOINT_COUNT; ++ep) {
+            std::string backupUrl = API_ENDPOINTS[ep];
+            backupUrl += "&domain=" + domain;
+            if (!apiKey.empty()) backupUrl += "&key=" + apiKey;
+
+            std::wstring backupServer, backupPath;
+            int backupPort = 80;
+            bool backupSSL = false;
+            if (parseUrl(backupUrl, backupServer, backupPort, backupPath, backupSSL)) {
+                json = httpGet(backupServer, backupPort, backupPath, backupSSL, TIMEOUT_MS);
+                if (!json.empty()) break;
+            }
+        }
+    }
 
     auto end = std::chrono::steady_clock::now();
     result.responseTimeMs = (int)std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
