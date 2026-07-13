@@ -190,7 +190,7 @@ IcpResult IcpScanner::parseResponse(const std::string& json, const std::string& 
 
 std::string IcpScanner::httpGet(const std::wstring& server, int port,
                                  const std::wstring& path, bool useSSL,
-                                 DWORD timeoutMs) {
+                                 unsigned long timeoutMs) {
     std::string response;
 
     HINTERNET hSession = WinHttpOpen(
