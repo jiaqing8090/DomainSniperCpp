@@ -9,8 +9,9 @@
 
 namespace DomainSniper {
 
-// 默认免费ICP查询API (可配置)
-static const char* DEFAULT_ICP_API = "https://api.uomg.com/api/icp";
+// 默认免费ICP查询API (公共测试ID/KEY，每分钟限频，建议注册后替换为自己的)
+// 接口盒子: https://www.apihz.cn/api/wangzhanicp.html
+static const char* DEFAULT_ICP_API = "https://cn.apihz.cn/api/wangzhan/icp.php?id=88888888&key=88888888";
 
 IcpScanner::IcpScanner() : m_apiUrl(DEFAULT_ICP_API) {}
 
@@ -150,52 +151,31 @@ IcpResult IcpScanner::parseResponse(const std::string& json, const std::string& 
     }
 
     // 解析API返回的JSON
-    // 支持多种API格式:
-    // 格式1: {"code":1,"msg":"success","data":{"icp":"京ICP备030173号",...}}
-    // 格式2: {"success":true,"data":{"icp":"京ICP备030173号",...}}
-    // 格式3: {"code":200,"data":{"icp":"京ICP备030173号",...}}
+    // 接口盒子(apihz.cn)格式:
+    // 成功: {"code":200,"type":"企业","icp":"京ICP证030173号-1","unit":"北京百度网讯科技有限公司","time":"2019-05-16"}
+    // 未备案: {"code":200,"type":"查询失败","icp":"查询失败","unit":"查询失败","time":"查询失败"}
+    // 错误: {"code":400,"msg":"错误信息"}
+
+    result.success = true; // HTTP请求成功，API有响应
 
     std::string code = jsonGetString(json, "code");
-    bool success = (code == "1" || code == "200" || code == "0");
-
-    // 也检查 success 字段
-    std::string successStr = jsonGetString(json, "success");
-    if (successStr == "true") success = true;
-
-    result.success = true; // HTTP请求成功
-
-    if (!success && !code.empty()) {
+    if (code == "400") {
         std::string msg = jsonGetString(json, "msg");
-        if (msg.empty()) msg = jsonGetString(json, "message");
-        result.errorMsg = msg.empty() ? "查询失败" : msg;
+        result.success = false;
+        result.errorMsg = msg.empty() ? "API返回错误" : msg;
         result.hasIcp = false;
         return result;
     }
 
-    // 提取 data 对象中的内容
+    // code == 200: 成功响应
     result.icpNumber = jsonGetString(json, "icp");
-    if (result.icpNumber.empty()) result.icpNumber = jsonGetString(json, "icpno");
-    if (result.icpNumber.empty()) result.icpNumber = jsonGetString(json, "filingNumber");
+    result.companyType = jsonGetString(json, "type");
+    result.companyName = jsonGetString(json, "unit");
+    result.auditTime = jsonGetString(json, "time");
+    result.siteUrl = jsonGetString(json, "domain");
 
-    result.companyName = jsonGetString(json, "company");
-    if (result.companyName.empty()) result.companyName = jsonGetString(json, "unitName");
-    if (result.companyName.empty()) result.companyName = jsonGetString(json, "siteName");
-    if (result.companyName.empty()) result.companyName = jsonGetString(json, "sponsorName");
-
-    result.companyType = jsonGetString(json, "companyType");
-    if (result.companyType.empty()) result.companyType = jsonGetString(json, "unitType");
-    if (result.companyType.empty()) result.companyType = jsonGetString(json, "natureName");
-
-    result.auditTime = jsonGetString(json, "auditTime");
-    if (result.auditTime.empty()) result.auditTime = jsonGetString(json, "passDate");
-    if (result.auditTime.empty()) result.auditTime = jsonGetString(json, "limitAccess");
-
-    result.siteName = jsonGetString(json, "siteName");
-    if (result.siteName.empty()) result.siteName = jsonGetString(json, "siteName");
-    result.siteUrl = jsonGetString(json, "siteUrl");
-    if (result.siteUrl.empty()) result.siteUrl = jsonGetString(json, "siteAddress");
-
-    result.hasIcp = !result.icpNumber.empty();
+    // 判断是否有备案: icp字段不是"查询失败"且非空
+    result.hasIcp = (!result.icpNumber.empty() && result.icpNumber != "查询失败");
 
     if (!result.hasIcp) {
         result.errorMsg = "未备案";
@@ -282,10 +262,9 @@ IcpResult IcpScanner::querySingle(const std::string& domain,
     std::string url = apiUrl.empty() ? DEFAULT_ICP_API : apiUrl;
 
     // 构建完整URL: API + domain参数
-    // 如果API URL已包含参数分隔符则用&，否则用?
+    // 基础URL已包含 ?id=xxx&key=xxx，追加 &domain=
     std::string fullUrl = url;
-    bool hasQuery = (fullUrl.find('?') != std::string::npos);
-    fullUrl += (hasQuery ? "&" : "?") + std::string("domain=") + domain;
+    fullUrl += "&domain=" + domain;
 
     if (!apiKey.empty()) {
         fullUrl += "&key=" + apiKey;

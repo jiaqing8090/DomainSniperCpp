@@ -142,7 +142,7 @@ static bool icpApiConfigured = false;
 // 初始化ICP API URL
 static void InitIcpApiUrl() {
     if (icpApiUrlBuf[0] == '\0') {
-        strcpy(icpApiUrlBuf, "https://api.uomg.com/api/icp");
+        strcpy(icpApiUrlBuf, "https://cn.apihz.cn/api/wangzhan/icp.php?id=88888888&key=88888888");
     }
 }
 
@@ -175,6 +175,8 @@ static void IcpCheckThreadFunc() {
             }
         }
         icpCheckedCount++;
+        // 公共API限频~328次/分钟，间隔500ms避免触发
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
 }
 
